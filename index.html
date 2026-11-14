@@ -15,21 +15,79 @@
   <p style="font-size:.85rem;color:#556">Demo académica (proyecto universitario): no es un canal oficial de la CCSS ni da consejo médico. Emergencias: 911.</p>
 </div>
 <script>
-// Enlace estable: la demo corre detrás de un túnel de Cloudflare cuya dirección cambia en cada arranque; aquí se lee la
-// vigente (endpoint.json, que la publica el servidor) y se redirige conservando el #t=... (el código de acceso no sale
-// del navegador). Código: repo privado lucasague/ccss-chatbot.
-(async () => {
+// Enlace estable. La demo corre en un PC detrás de dos direcciones públicas, y endpoint.json (lo publica el servidor)
+// las trae: `url`, un túnel de Cloudflare que cambia cuando se relanza, y `fija`, una dirección que no cambia, cifrada
+// con el código de acceso del enlace (#t=...). Aquí se prueban (GET /salud) y se redirige a la primera que responde,
+// conservando el #t=... (el código no sale del navegador). Si ninguna responde, se sigue intentando sin cerrar.
+// Esta página es la copia versionada de index.html del repo público lucasague/ccss-demo (docs/chat-web.md).
+(() => {
   const $e = document.getElementById('estado');
-  const fuentes = ['https://api.github.com/repos/lucasague/ccss-demo/contents/endpoint.json', 'endpoint.json?ts=' + Date.now()];
-  for (const f of fuentes) {
-    try {
-      const r = await fetch(f, { cache: 'no-store', headers: f.includes('api.github.com') ? { Accept: 'application/vnd.github.raw+json' } : {} });
-      if (!r.ok) continue;
-      const j = await r.json();
-      if (j.url && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(j.url)) { location.replace(j.url + '/chat' + location.hash); return; }
-    } catch {}
+  const token = new URLSearchParams(location.hash.slice(1)).get('t') || '';
+  const PERMITIDA = /^https:\/\/(?:[a-z0-9]+(?:-[a-z0-9]+)+\.trycloudflare\.com|[a-z0-9-]+\.[a-z0-9-]+\.ts\.net(?::\d{2,5})?)$/;
+  const pausa = ms => new Promise(r => setTimeout(r, ms));
+
+  // AES-256-GCM, clave SHA-256('ccss-fija|' + código); formato base64url(iv[12] + cifrado + etiqueta): lib/publicar.js.
+  async function descifrar(txt) {
+    const bin = Uint8Array.from(atob(String(txt).replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('ccss-fija|' + token));
+    const clave = await crypto.subtle.importKey('raw', hash, 'AES-GCM', false, ['decrypt']);
+    return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bin.slice(0, 12) }, clave, bin.slice(12)));
   }
-  $e.textContent = 'No se pudo abrir la demo ahora mismo. Inténtalo en unos minutos.';
+
+  // La copia de Pages no tiene límite de peticiones pero tarda 1-2 min en verse tras un cambio; la API de GitHub es
+  // inmediata pero admite 60 peticiones por hora y por IP: se consulta primero solo de vez en cuando.
+  async function direcciones(apiPrimero) {
+    const api = 'https://api.github.com/repos/lucasague/ccss-demo/contents/endpoint.json', pages = 'endpoint.json?ts=' + Date.now();
+    for (const f of apiPrimero ? [api, pages] : [pages, api]) {
+      try {
+        const r = await fetch(f, { cache: 'no-store', headers: f === api ? { Accept: 'application/vnd.github.raw+json' } : {} });
+        if (!r.ok) continue;
+        const j = await r.json();
+        const lista = [];
+        if (j.fija && token) { try { lista.push(await descifrar(j.fija)); } catch {} }
+        if (j.url) lista.push(j.url);
+        const buenas = [...new Set(lista.filter(u => typeof u === 'string' && PERMITIDA.test(u)))];
+        if (buenas.length) return buenas;
+      } catch {}
+    }
+    return [];
+  }
+
+  // /salud se lee con CORS: la página de error de un túnel caído no trae la cabecera y cuenta como caída.
+  async function viva(u) {
+    const corte = new AbortController();
+    const reloj = setTimeout(() => corte.abort(), 6000);
+    try { const r = await fetch(u + '/salud', { cache: 'no-store', signal: corte.signal }); return r.ok && (await r.json()).ok === true; }
+    catch { return false; }
+    finally { clearTimeout(reloj); }
+  }
+
+  // Se prueban todas a la vez. Gana la primera de la lista que responda (la fija va primero); si responde antes una
+  // de más abajo, se espera 2 s a las de arriba y, si no llegan, se entra por ella.
+  function elegir(lista) {
+    return new Promise(res => {
+      if (!lista.length) return res(null);
+      const est = lista.map(() => null);
+      let fin = false, reloj = null;
+      const cerrar = () => { if (fin) return; fin = true; clearTimeout(reloj); const i = est.indexOf(true); res(i >= 0 ? lista[i] : null); };
+      lista.forEach((u, i) => viva(u).then(v => {
+        est[i] = v;
+        const mejor = est.indexOf(true);
+        if (mejor >= 0 && est.slice(0, mejor).every(x => x === false)) return cerrar();
+        if (est.every(x => x !== null)) return cerrar();
+        if (mejor >= 0 && !reloj) reloj = setTimeout(cerrar, 2000);
+      }));
+    });
+  }
+
+  (async () => {
+    for (let n = 0; ; n++) {
+      const u = await elegir(await direcciones(n % 6 === 1));
+      if (u) { location.replace(u + '/chat' + location.hash); return; }
+      $e.textContent = n < 1 ? 'Abriendo la demo…' : 'El asistente no responde ahora mismo. Sigo intentándolo: no cierres esta página.';
+      await pausa(n < 1 ? 1500 : 5000);
+    }
+  })();
 })();
 </script>
 </body>
